@@ -8,6 +8,60 @@ A lock-free, multi-producer single-consumer `AsyncChannel` for Swift Concurrency
 - **Optional backpressure** with low and high watermarks.
 - **Non-blocking `tryNext()` and time-limited `next(timeout:)` receivers.**
 
+## Why not `AsyncStream` or `MultiProducerSingleConsumerAsyncChannel`?
+
+Swift already has two channels of this kind: Foundation/stdlib [`AsyncStream`](https://developer.apple.com/documentation/swift/asyncstream) and [`MultiProducerSingleConsumerAsyncChannel`](https://github.com/apple/swift-async-algorithms) from swift-async-algorithms. `AsyncChannel` differs from both in API and in speed.
+
+### More ways to receive
+
+|                                       | `AsyncChannel` | `AsyncStream` | `MultiProducerSingleConsumerAsyncChannel` |
+|---------------------------------------|:--------------:|:-------------:|:-----------------------------------------:|
+| `await next()`                        | ✅             | ✅            | ✅                                        |
+| `tryNext()`: non-blocking receive     | ✅             | ❌            | ❌                                        |
+| `next(timeout:)`: receive with timeout | ✅             | ❌            | ❌                                        |
+| Synchronous `send` from any thread    | ✅             | ✅            | ✅                                        |
+| Backpressure                          | ✅ watermarks  | ❌ (only dropping buffer policies) | ✅ watermarks       |
+
+With the other two channels, polling or a timeout means racing `next()` against a sleeping task in a task group. That adds a task, an allocation and a cancellation on every call, and cancelling `next()` can terminate the whole stream. `AsyncChannel` provides both operations directly.
+
+### Much faster
+
+The benchmark in [`Benchmarks/`](Benchmarks) has one producer task send 1,000,000 `Int`s while one consumer task receives them. It measures two things:
+
+- **dispatch:** the time the producer needs to send all elements.
+- **first dispatch to last receive:** the time from the first `send` until the consumer has the last element.
+
+Apple M3 Max, macOS 27, Swift 6.4, release build, median of 8 rounds after 2 warm-up rounds:
+
+**Dispatch**
+
+| Channel                                   | min ms | median ms | max ms | ns/element |
+|-------------------------------------------|-------:|----------:|-------:|-----------:|
+| **AsyncChannel**                          | **5.98** | **6.04** | **6.17** | **6.04** |
+| AsyncStream                               | 642.13 | 765.52    | 809.94 | 765.52     |
+| MultiProducerSingleConsumerAsyncChannel   | 381.37 | 397.79    | 406.36 | 397.79     |
+
+**First dispatch to last receive**
+
+| Channel                                   | min ms | median ms | max ms | ns/element |
+|-------------------------------------------|-------:|----------:|-------:|-----------:|
+| **AsyncChannel**                          | **24.91** | **25.06** | **25.22** | **25.06** |
+| AsyncStream                               | 1070.21 | 1106.14  | 1124.34 | 1106.14   |
+| MultiProducerSingleConsumerAsyncChannel   | 386.80 | 401.57    | 408.97 | 401.57     |
+
+At the median, `AsyncChannel` sends about **66× faster** than `MultiProducerSingleConsumerAsyncChannel` and **127× faster** than `AsyncStream`. End to end it is about **16×** and **44×** faster.
+
+The difference comes from the design. `AsyncStream` and `MultiProducerSingleConsumerAsyncChannel` take a lock on every `send` and `next`, and their consumer and producers contend for it. In `AsyncChannel`, a producer reserves a slot in a linked list of fixed-size blocks with a CAS on the tail word, writes the element in place and marks the slot as written. The consumer reads slots in order, without locks. It suspends only when the next slot is still empty, and the producer that fills that slot resumes it.
+
+To run the benchmark yourself:
+
+```sh
+cd Benchmarks
+swift run -c release                         # all cases, 1,000,000 elements
+swift run -c release Benchmarks 100000       # custom element count
+swift run -c release Benchmarks --only async-channel --only mpsc
+```
+
 ## Requirements
 
 - Swift 6.0+
@@ -143,60 +197,6 @@ Task {
 - `sink.finish()` closes the channel. Elements already sent are still delivered, and after them `next()` returns `nil`. Later `send` calls return `.closed`.
 - Dropping the `AsyncChannel` (the consumer) also closes it. Producers waiting in `waitForDemand()` are resumed with `false`.
 - Cancelling the task that is suspended in `next()` closes the channel.
-
-## Why not `AsyncStream` or `MultiProducerSingleConsumerAsyncChannel`?
-
-Swift already has two channels of this kind: Foundation/stdlib [`AsyncStream`](https://developer.apple.com/documentation/swift/asyncstream) and [`MultiProducerSingleConsumerAsyncChannel`](https://github.com/apple/swift-async-algorithms) from swift-async-algorithms. `AsyncChannel` differs from both in API and in speed.
-
-### More ways to receive
-
-|                                       | `AsyncChannel` | `AsyncStream` | `MultiProducerSingleConsumerAsyncChannel` |
-|---------------------------------------|:--------------:|:-------------:|:-----------------------------------------:|
-| `await next()`                        | ✅             | ✅            | ✅                                        |
-| `tryNext()`: non-blocking receive     | ✅             | ❌            | ❌                                        |
-| `next(timeout:)`: receive with timeout | ✅             | ❌            | ❌                                        |
-| Synchronous `send` from any thread    | ✅             | ✅            | ✅                                        |
-| Backpressure                          | ✅ watermarks  | ❌ (only dropping buffer policies) | ✅ watermarks       |
-
-With the other two channels, polling or a timeout means racing `next()` against a sleeping task in a task group. That adds a task, an allocation and a cancellation on every call, and cancelling `next()` can terminate the whole stream. `AsyncChannel` provides both operations directly.
-
-### Much faster
-
-The benchmark in [`Benchmarks/`](Benchmarks) has one producer task send 1,000,000 `Int`s while one consumer task receives them. It measures two things:
-
-- **dispatch:** the time the producer needs to send all elements.
-- **first dispatch to last receive:** the time from the first `send` until the consumer has the last element.
-
-Apple M3 Max, macOS 27, Swift 6.4, release build, median of 8 rounds after 2 warm-up rounds:
-
-**Dispatch**
-
-| Channel                                   | min ms | median ms | max ms | ns/element |
-|-------------------------------------------|-------:|----------:|-------:|-----------:|
-| **AsyncChannel**                          | **5.98** | **6.04** | **6.17** | **6.04** |
-| AsyncStream                               | 642.13 | 765.52    | 809.94 | 765.52     |
-| MultiProducerSingleConsumerAsyncChannel   | 381.37 | 397.79    | 406.36 | 397.79     |
-
-**First dispatch to last receive**
-
-| Channel                                   | min ms | median ms | max ms | ns/element |
-|-------------------------------------------|-------:|----------:|-------:|-----------:|
-| **AsyncChannel**                          | **24.91** | **25.06** | **25.22** | **25.06** |
-| AsyncStream                               | 1070.21 | 1106.14  | 1124.34 | 1106.14   |
-| MultiProducerSingleConsumerAsyncChannel   | 386.80 | 401.57    | 408.97 | 401.57     |
-
-At the median, `AsyncChannel` sends about **66× faster** than `MultiProducerSingleConsumerAsyncChannel` and **127× faster** than `AsyncStream`. End to end it is about **16×** and **44×** faster.
-
-The difference comes from the design. `AsyncStream` and `MultiProducerSingleConsumerAsyncChannel` take a lock on every `send` and `next`, and their consumer and producers contend for it. In `AsyncChannel`, a producer reserves a slot in a linked list of fixed-size blocks with a CAS on the tail word, writes the element in place and marks the slot as written. The consumer reads slots in order, without locks. It suspends only when the next slot is still empty, and the producer that fills that slot resumes it.
-
-To run the benchmark yourself:
-
-```sh
-cd Benchmarks
-swift run -c release                         # all cases, 1,000,000 elements
-swift run -c release Benchmarks 100000       # custom element count
-swift run -c release Benchmarks --only async-channel --only mpsc
-```
 
 ## How it works
 
