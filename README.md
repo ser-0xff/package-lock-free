@@ -26,40 +26,41 @@ With the other two channels, polling or a timeout means racing `next()` against 
 
 ### Much faster
 
-The benchmark in [`Benchmarks/`](Benchmarks) has one producer task send 1,000,000 `Int`s while one consumer task receives them. It measures two things:
+The benchmark in [`Benchmarks/`](Benchmarks) uses [package-benchmark](https://github.com/ordo-one/benchmark). In every iteration one producer sends 1,000,000 `Int`s while one consumer task receives them. Creating the channel and starting the consumer are not measured. It measures two things:
 
 - **dispatch:** the time the producer needs to send all elements.
 - **first dispatch to last receive:** the time from the first `send` until the consumer has the last element.
 
-Apple M3 Max, macOS 27, Swift 6.4, release build, median of 8 rounds after 2 warm-up rounds:
+Apple M3 Max, macOS 27, Swift 6.4, release build, 20 iterations after 2 warm-up iterations (9 for `AsyncStream`, which reaches the 10 s limit first). All values are per element:
 
 **Dispatch**
 
-| Channel                                   | min ms | median ms | max ms | ns/element |
-|-------------------------------------------|-------:|----------:|-------:|-----------:|
-| **AsyncChannel**                          | **5.98** | **6.04** | **6.17** | **6.04** |
-| AsyncStream                               | 642.13 | 765.52    | 809.94 | 765.52     |
-| MultiProducerSingleConsumerAsyncChannel   | 381.37 | 397.79    | 406.36 | 397.79     |
+| Channel                                   | wall p0 ns | wall p50 ns | wall p100 ns | CPU p50 ns | mallocs |
+|-------------------------------------------|-----------:|------------:|-------------:|-----------:|--------:|
+| **AsyncChannel**                          | **6**      | **6**       | **6**        | **6**      | **0**   |
+| AsyncStream                               | 742        | 893         | 1018         | 1418       | 1       |
+| MultiProducerSingleConsumerAsyncChannel   | 235        | 277         | 396          | 516        | 1       |
 
 **First dispatch to last receive**
 
-| Channel                                   | min ms | median ms | max ms | ns/element |
-|-------------------------------------------|-------:|----------:|-------:|-----------:|
-| **AsyncChannel**                          | **24.91** | **25.06** | **25.22** | **25.06** |
-| AsyncStream                               | 1070.21 | 1106.14  | 1124.34 | 1106.14   |
-| MultiProducerSingleConsumerAsyncChannel   | 386.80 | 401.57    | 408.97 | 401.57     |
+| Channel                                   | wall p0 ns | wall p50 ns | wall p100 ns | CPU p50 ns | mallocs |
+|-------------------------------------------|-----------:|------------:|-------------:|-----------:|--------:|
+| **AsyncChannel**                          | **26**     | **26**      | **26**       | **32**     | **0**   |
+| AsyncStream                               | 1138       | 1145        | 1193         | 1648       | 2       |
+| MultiProducerSingleConsumerAsyncChannel   | 285        | 333         | 385          | 607        | 1       |
 
-At the median, `AsyncChannel` sends about **66× faster** than `MultiProducerSingleConsumerAsyncChannel` and **127× faster** than `AsyncStream`. End to end it is about **16×** and **44×** faster.
+At the median, `AsyncChannel` sends about **46× faster** than `MultiProducerSingleConsumerAsyncChannel` and **149× faster** than `AsyncStream`. End to end it is about **13×** and **44×** faster. It also does no allocation per element: elements go into blocks that each hold many slots, so the allocation count rounds to 0 per element.
 
 The difference comes from the design. `AsyncStream` and `MultiProducerSingleConsumerAsyncChannel` take a lock on every `send` and `next`, and their consumer and producers contend for it. In `AsyncChannel`, a producer reserves a slot in a linked list of fixed-size blocks with a CAS on the tail word, writes the element in place and marks the slot as written. The consumer reads slots in order, without locks. It suspends only when the next slot is still empty, and the producer that fills that slot resumes it.
 
-To run the benchmark yourself:
+To run the benchmark yourself (package-benchmark needs `jemalloc`, e.g. `brew install jemalloc`):
 
 ```sh
 cd Benchmarks
-swift run -c release                         # all cases, 1,000,000 elements
-swift run -c release Benchmarks 100000       # custom element count
-swift run -c release Benchmarks --only async-channel --only mpsc
+swift package benchmark                                  # all cases, 1,000,000 elements per iteration
+swift package benchmark --filter "AsyncChannel.*"        # only some cases
+swift package benchmark baseline update main             # save a baseline...
+swift package benchmark baseline compare main            # ...and compare against it later
 ```
 
 ## Requirements
